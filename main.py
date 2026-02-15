@@ -34,6 +34,8 @@ if __name__ == "__main__":
     parser.add_argument('--num_epochs', default=10, type=int)
     parser.add_argument("--stage1_lr", type=float, default=0.0001)
     parser.add_argument("--stage2_lr", type=float, default=0.0001)
+    parser.add_argument('--phase1_epoch', default=10, type=int, help='Phase 1 checkpoint epoch to load for stage2/inference')
+    parser.add_argument('--phase2_epoch', default=5, type=int, help='Phase 2 checkpoint epoch to load for inference')
     
     args = parser.parse_args()
     

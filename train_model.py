@@ -103,7 +103,7 @@ def train_model_phase2_(rank,world_size,args):
     random.seed(0)
 
     model = A_llmrec_model(args).to(args.device)
-    phase1_epoch = 10
+    phase1_epoch = args.phase1_epoch
     model.load_model(args, phase1_epoch=phase1_epoch)
 
     dataset = data_partition(args.rec_pre_trained_data, path=f'./data/amazon/{args.rec_pre_trained_data}.txt')
@@ -122,7 +122,7 @@ def train_model_phase2_(rank,world_size,args):
     else:
         train_data_loader = DataLoader(train_data_set, batch_size = args.batch_size2, pin_memory=True, shuffle=True)
     adam_optimizer = torch.optim.Adam(model.parameters(), lr=args.stage2_lr, betas=(0.9, 0.98))
-    
+
     epoch_start_idx = 1
     T = 0.0
     model.train()
@@ -153,8 +153,8 @@ def inference_(rank, world_size, args):
         args.device = 'cuda:' + str(rank)
         
     model = A_llmrec_model(args).to(args.device)
-    phase1_epoch = 10
-    phase2_epoch = 5
+    phase1_epoch = args.phase1_epoch
+    phase2_epoch = args.phase2_epoch
     model.load_model(args, phase1_epoch=phase1_epoch, phase2_epoch=phase2_epoch)
 
     dataset = data_partition(args.rec_pre_trained_data, path=f'./data/amazon/{args.rec_pre_trained_data}.txt')
