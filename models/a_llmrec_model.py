@@ -4,11 +4,28 @@ import pickle
 import torch
 from torch.cuda.amp import autocast as autocast
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 from models.recsys_model import *
 from models.llm4rec import *
 from sentence_transformers import SentenceTransformer
+
+
+def clip_contrastive_loss(emb_a, emb_b, temperature):
+    """CLIP-style symmetric contrastive loss.
+
+    Builds a (batch x batch) cosine similarity matrix between two sets of
+    embeddings and applies symmetric cross-entropy so that matched pairs
+    (diagonal) score highest.
+    """
+    emb_a = F.normalize(emb_a, dim=-1)
+    emb_b = F.normalize(emb_b, dim=-1)
+    logits = emb_a @ emb_b.T / temperature.exp()
+    labels = torch.arange(logits.size(0), device=logits.device)
+    loss_ab = F.cross_entropy(logits, labels)
+    loss_ba = F.cross_entropy(logits.T, labels)
+    return (loss_ab + loss_ba) / 2
 
 
 class two_layer_mlp(nn.Module):
@@ -43,7 +60,10 @@ class A_llmrec_model(nn.Module):
         if args.pretrain_stage1:
             self.sbert = SentenceTransformer('nq-distilbert-base-v1')
             self.mlp2 = two_layer_mlp(self.sbert_dim)
-        
+            # Learnable log-temperature for CLIP contrastive loss (init ~1/0.07)
+            self.clip_log_temp = nn.Parameter(torch.tensor(np.log(1.0 / 0.07)))
+            self.clip_loss_weight = getattr(args, 'clip_loss_weight', 0.5)
+
         self.mse = nn.MSELoss()
         
         self.maxlen = args.maxlen
@@ -178,54 +198,63 @@ class A_llmrec_model(nn.Module):
         gt_loss = 0
         rc_loss = 0
         text_rc_loss = 0
-        original_loss = 0
+        clip_loss_acc = 0
         while start_inx < len(log_emb_):
             log_emb = log_emb_[start_inx:end_inx]
             pos_emb = pos_emb_[start_inx:end_inx]
             neg_emb = neg_emb_[start_inx:end_inx]
-            
+
             pos__ = pos_[start_inx:end_inx]
             neg__ = neg_[start_inx:end_inx]
-            
+
             start_inx = end_inx
             end_inx += 60
             iterss +=1
-            
+
             pos_text = self.find_item_text(pos__)
             neg_text = self.find_item_text(neg__)
-            
+
             pos_token = self.sbert.tokenize(pos_text)
             pos_text_embedding= self.sbert({'input_ids':pos_token['input_ids'].to(self.device),'attention_mask':pos_token['attention_mask'].to(self.device)})['sentence_embedding']
             neg_token = self.sbert.tokenize(neg_text)
             neg_text_embedding= self.sbert({'input_ids':neg_token['input_ids'].to(self.device),'attention_mask':neg_token['attention_mask'].to(self.device)})['sentence_embedding']
-            
+
             pos_text_matching, pos_proj = self.mlp(pos_emb)
             neg_text_matching, neg_proj = self.mlp(neg_emb)
-            
+
             pos_text_matching_text, pos_text_proj = self.mlp2(pos_text_embedding)
             neg_text_matching_text, neg_text_proj = self.mlp2(neg_text_embedding)
-            
+
             pos_logits, neg_logits = (log_emb*pos_proj).mean(axis=1), (log_emb*neg_proj).mean(axis=1)
             pos_labels, neg_labels = torch.ones(pos_logits.shape, device=pos_logits.device), torch.zeros(neg_logits.shape, device=pos_logits.device)
 
             loss = self.bce_criterion(pos_logits, pos_labels)
             loss += self.bce_criterion(neg_logits, neg_labels)
-            
+
             matching_loss = self.mse(pos_text_matching,pos_text_matching_text) + self.mse(neg_text_matching,neg_text_matching_text)
             reconstruction_loss = self.mse(pos_proj,pos_emb) + self.mse(neg_proj,neg_emb)
             text_reconstruction_loss = self.mse(pos_text_proj,pos_text_embedding.data) + self.mse(neg_text_proj,neg_text_embedding.data)
-            
-            total_loss = loss + matching_loss + 0.5*reconstruction_loss + 0.2*text_reconstruction_loss
+
+            # CLIP-style contrastive loss: align collaborative and text
+            # embeddings across the batch using symmetric cross-entropy
+            clip_loss = clip_contrastive_loss(
+                pos_text_matching, pos_text_matching_text, self.clip_log_temp
+            )
+
+            total_loss = (loss + matching_loss + 0.5*reconstruction_loss
+                          + 0.2*text_reconstruction_loss
+                          + self.clip_loss_weight * clip_loss)
             total_loss.backward()
             optimizer.step()
-            
+
             mean_loss += total_loss.item()
             bpr_loss += loss.item()
             gt_loss += matching_loss.item()
             rc_loss += reconstruction_loss.item()
             text_rc_loss += text_reconstruction_loss.item()
-            
-        print("loss in epoch {}/{} iteration {}/{}: {} / BPR loss: {} / Matching loss: {} / Item reconstruction: {} / Text reconstruction: {}".format(epoch, total_epoch, step, total_step, mean_loss/iterss, bpr_loss/iterss, gt_loss/iterss, rc_loss/iterss, text_rc_loss/iterss))
+            clip_loss_acc += clip_loss.item()
+
+        print("loss in epoch {}/{} iteration {}/{}: {} / BPR loss: {} / Matching loss: {} / Item reconstruction: {} / Text reconstruction: {} / CLIP loss: {}".format(epoch, total_epoch, step, total_step, mean_loss/iterss, bpr_loss/iterss, gt_loss/iterss, rc_loss/iterss, text_rc_loss/iterss, clip_loss_acc/iterss))
     
     def make_interact_text(self, interact_ids, interact_max_num):
         interact_item_titles_ = self.find_item_text(interact_ids, title_flag=True, description_flag=False)
